@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
 // SPDX-License-Identifier: MIT
 
-//go:build !js
-// +build !js
-
-package webrtc
+package networkcorrector
 
 import (
 	"testing"
@@ -13,12 +10,13 @@ import (
 	"github.com/pion/interceptor"
 	"github.com/pion/logging"
 	"github.com/pion/transport/v3/vnet"
+	"github.com/pion/webrtc/v4"
 	"github.com/stretchr/testify/assert"
 )
 
 func createVNetPair(t *testing.T, interceptorRegistry *interceptor.Registry) (
-	*PeerConnection,
-	*PeerConnection,
+	*webrtc.PeerConnection,
+	*webrtc.PeerConnection,
 	*vnet.Router,
 ) {
 	t.Helper()
@@ -38,7 +36,7 @@ func createVNetPair(t *testing.T, interceptorRegistry *interceptor.Registry) (
 	// Add the network interface to the router
 	assert.NoError(t, wan.AddNet(offerVNet))
 
-	offerSettingEngine := SettingEngine{}
+	offerSettingEngine := webrtc.SettingEngine{}
 	offerSettingEngine.SetNet(offerVNet)
 	offerSettingEngine.SetICETimeouts(time.Second, time.Second, time.Millisecond*200)
 
@@ -51,25 +49,25 @@ func createVNetPair(t *testing.T, interceptorRegistry *interceptor.Registry) (
 	// Add the network interface to the router
 	assert.NoError(t, wan.AddNet(answerVNet))
 
-	answerSettingEngine := SettingEngine{}
+	answerSettingEngine := webrtc.SettingEngine{}
 	answerSettingEngine.SetNet(answerVNet)
 	answerSettingEngine.SetICETimeouts(time.Second, time.Second, time.Millisecond*200)
 
 	// Start the virtual network by calling Start() on the root router
 	assert.NoError(t, wan.Start())
 
-	offerOptions := []func(*API){WithSettingEngine(offerSettingEngine)}
+	offerOptions := []func(*webrtc.API){webrtc.WithSettingEngine(offerSettingEngine)}
 	if interceptorRegistry != nil {
-		offerOptions = append(offerOptions, WithInterceptorRegistry(interceptorRegistry))
+		offerOptions = append(offerOptions, webrtc.WithInterceptorRegistry(interceptorRegistry))
 	}
-	offerPeerConnection, err := NewAPI(offerOptions...).NewPeerConnection(Configuration{})
+	offerPeerConnection, err := webrtc.NewAPI(offerOptions...).NewPeerConnection(webrtc.Configuration{})
 	assert.NoError(t, err)
 
-	answerOptions := []func(*API){WithSettingEngine(answerSettingEngine)}
+	answerOptions := []func(*webrtc.API){webrtc.WithSettingEngine(answerSettingEngine)}
 	if interceptorRegistry != nil {
-		answerOptions = append(answerOptions, WithInterceptorRegistry(interceptorRegistry))
+		answerOptions = append(answerOptions, webrtc.WithInterceptorRegistry(interceptorRegistry))
 	}
-	answerPeerConnection, err := NewAPI(answerOptions...).NewPeerConnection(Configuration{})
+	answerPeerConnection, err := webrtc.NewAPI(answerOptions...).NewPeerConnection(webrtc.Configuration{})
 	assert.NoError(t, err)
 
 	return offerPeerConnection, answerPeerConnection, wan
