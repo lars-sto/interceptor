@@ -18,18 +18,16 @@ import (
 
 const (
 	numPackets = 200
+	waitTime   = 1500 // wait time in milliseconds before stats are being collected
 )
 
 func TestNetworkcorrector(t *testing.T) {
-	// Create interceptorRegistry with default interceptots
 	interceptorRegistry := &interceptor.Registry{}
 
-	// Create mediaEngine with default codecs
 	mediaEngine := &webrtc.MediaEngine{}
 	err := mediaEngine.RegisterDefaultCodecs()
 	assert.NoError(t, err)
 
-	// Configure flexfec-03
 	err = webrtc.ConfigureFlexFEC03(49, mediaEngine, interceptorRegistry)
 	assert.NoError(t, err)
 
@@ -58,6 +56,8 @@ func TestNetworkcorrector(t *testing.T) {
 
 	done := make(chan struct{})
 
+	rtcpSeen := make(chan struct{})
+
 	// Sender RTCP feedback receive stream
 	go func() {
 		rtcpBuf := make([]byte, 1500)
@@ -70,13 +70,33 @@ func TestNetworkcorrector(t *testing.T) {
 			ps, err2 := rtcp.Unmarshal(rtcpBuf[:n])
 			assert.NoError(t, err2)
 
-			for _, p := range ps {
-				pn, ok := p.(*rtcp.TransportLayerNack)
-				if !ok {
-					continue
-				}
-				fmt.Printf("Received RTCP Packet %s\n", pn)
+			rtcpSeen <- struct{}{}
 
+			for _, p := range ps {
+				switch pkt := p.(type) {
+
+				case *rtcp.TransportLayerNack:
+					fmt.Printf("Received RTCP NACK Packet %s\n", pkt)
+				
+				case *rtcp.ReceiverReport:
+					for _, rr := range pkt.Reports {
+						fmt.Printf("RTCP RR: ssrc=%d lost=%d jitter=%d\n",
+							rr.SSRC, rr.TotalLost, rr.Jitter)
+					}
+
+				case *rtcp.SenderReport:
+					fmt.Printf("RTCP SR: ssrc=%d ntp=%v rtpTime=%d\n",
+						pkt.SSRC, pkt.NTPTime, pkt.RTPTime)
+
+				case *rtcp.PictureLossIndication:
+					fmt.Printf("RTCP PLI: mediaSSRC=%d\n", pkt.MediaSSRC)
+
+				case *rtcp.TransportLayerCC:
+					fmt.Printf("RTCP TWCC: \n")
+
+				default:
+					fmt.Printf("RTCP other: %T\n", pkt)
+				}
 			}
 		}
 	}()
@@ -109,37 +129,40 @@ func TestNetworkcorrector(t *testing.T) {
 		for {
 			select {
 			case <-done:
-				time.Sleep(300 * time.Millisecond)
+				select {
+				case <-rtcpSeen:
+					// 1) Sender Stats (pcOffer)
+					fmt.Println(">>> SENDER (Offer) Stats:")
+					statsOffer := pcOffer.GetStats()
+					for id, stat := range statsOffer {
+						switch s := stat.(type) {
+						case webrtc.OutboundRTPStreamStats:
+							fmt.Printf("id(mapKey): %s | ID: %s | SSRC: %d | Kind: %s | PacketsSent: %d "+
+								"| BytesSent: %d\n",
+								id, s.ID, s.SSRC, s.Kind, s.PacketsSent, s.BytesSent)
+						}
+					}
+
+					// 2) Receiver Stats (pcAnswer)
+					fmt.Println("\n>>> RECEIVER (Answer) Stats:")
+					statsAnswer := pcAnswer.GetStats()
+					for id, stat := range statsAnswer {
+						switch s := stat.(type) {
+						case webrtc.InboundRTPStreamStats:
+							fmt.Printf("id(mapKey): %s | ID: %s | SSRC: %d | Kind: %s | PacketsReceived: %d "+
+								"| PacketsLost: %d | Jitter: %f | NACKCount: %d\n",
+								id, s.ID, s.SSRC, s.Kind, s.PacketsReceived, s.PacketsLost, s.Jitter, s.NACKCount)
+						}
+					}
+					fmt.Println("----------------------------------------------")
+
+					return
+				case <-time.After(waitTime * time.Millisecond):
+					t.Fatal("timed out waiting for RTCP sender report")
+				}
 
 				fmt.Println("\n---------------- STATS REPORT ----------------")
 
-				// 1. Sender Stats (pcOffer)
-				fmt.Println(">>> SENDER (Offer) Stats:")
-				statsOffer := pcOffer.GetStats()
-				for _, s := range statsOffer {
-					// Wir filtern nach 'outbound-rtp', da dies die gesendeten Pakete betrifft
-					if s.Type == webrtc.StatsTypeOutboundRTP {
-						// Casten für detaillierten Zugriff (optional), oder einfach ausgeben
-						stats, _ := s.(webrtc.OutboundRTPStreamStats)
-						fmt.Printf("ID: %s | PacketsSent: %d | BytesSent: %d\n",
-							stats.ID, stats.PacketsSent, stats.BytesSent)
-					}
-				}
-
-				// 2. Receiver Stats (pcAnswer)
-				fmt.Println("\n>>> RECEIVER (Answer) Stats:")
-				statsAnswer := pcAnswer.GetStats()
-				for _, s := range statsAnswer {
-					// Wir filtern nach 'inbound-rtp', da dies die empfangenen Pakete betrifft
-					if s.Type == webrtc.StatsTypeInboundRTP {
-						stats, _ := s.(webrtc.InboundRTPStreamStats)
-						fmt.Printf("ID: %s | PacketsReceived: %d | PacketsLost: %d | NackCount: %d | Jitter: %f\n",
-							stats.ID, stats.PacketsReceived, stats.PacketsLost, stats.NackCount, stats.Jitter)
-					}
-				}
-				fmt.Println("----------------------------------------------")
-
-				return
 			case <-time.After(20 * time.Millisecond):
 				// sending sample data every 20 ms
 				writeErr := track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second})
