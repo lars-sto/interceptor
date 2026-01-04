@@ -1,45 +1,196 @@
 package networkcorrector
 
 import (
+	"fmt"
+	"sync"
+	"time"
+
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 )
 
-// NoOp is an Interceptor that does not modify any packets. It can embedded in other interceptors, so it's
-// possible to implement only a subset of the methods.
-type networkcorrector struct{}
-
-// BindRTCPReader lets you modify any incoming RTCP packets. It is called once per sender/receiver, however this might
-// change in the future. The returned method will be called once per packet batch.
-func (i *networkcorrector) BindRTCPReader(reader interceptor.RTCPReader) interceptor.RTCPReader {
-	return reader
+type Factory struct {
+	Interval time.Duration
 }
 
-// BindRTCPWriter lets you modify any outgoing RTCP packets. It is called once per PeerConnection. The returned method
-// will be called once per packet batch.
-func (i *networkcorrector) BindRTCPWriter(writer interceptor.RTCPWriter) interceptor.RTCPWriter {
-	return writer
+func NewFactory() *Factory {
+	return &Factory{Interval: 500 * time.Millisecond}
 }
 
-// BindLocalStream lets you modify any outgoing RTP packets. It is called once for per LocalStream. The returned method
-// will be called once per rtp packet.
-func (i *networkcorrector) BindLocalStream(_ *interceptor.StreamInfo, writer interceptor.RTPWriter) interceptor.RTPWriter {
-	return writer
+// NewInterceptor erfüllt interceptor.Factory
+func (f *Factory) NewInterceptor(id string) (interceptor.Interceptor, error) {
+	fmt.Println("NetworkCorrector interceptor created, id=", id)
+	nc := &NetworkCorrector{
+		stop:     make(chan struct{}),
+		interval: f.Interval,
+	}
+
+	// Optional: nur fürs Debugging/Verstehen
+	go nc.observe()
+
+	return nc, nil
 }
 
-// UnbindLocalStream is called when the Stream is removed. It can be used to clean up any data related to that track.
-func (i *networkcorrector) UnbindLocalStream(_ *interceptor.StreamInfo) {}
-
-// BindRemoteStream lets you modify any incoming RTP packets.
-// It is called once for per RemoteStream. The returned method
-// will be called once per rtp packet.
-func (i *networkcorrector) BindRemoteStream(_ *interceptor.StreamInfo, reader interceptor.RTPReader) interceptor.RTPReader {
-	return reader
+type NetworkCorrector struct {
+	mu       sync.RWMutex
+	state    NetworkState
+	stop     chan struct{}
+	interval time.Duration
 }
 
-// UnbindRemoteStream is called when the Stream is removed. It can be used to clean up any data related to that track.
-func (i *networkcorrector) UnbindRemoteStream(_ *interceptor.StreamInfo) {}
+type NetworkState struct {
+	FractionLost float64 // 0..1
+	JitterRaw    uint32  // RR jitter in RTP timestamp units
+	UpdatedAt    time.Time
 
-// Close closes the Interceptor, cleaning up any data if necessary.
-func (i *networkcorrector) Close() error {
-	return nil
+	RTTSeconds      float64
+	QueueDelayTrend float64
 }
+
+type Decision struct {
+	// Platzhalter: später echte Stellgrößen
+	TargetFECLevel float64
+	EnableRTX      bool
+	TargetNackMode string
+	Reason         string
+}
+
+func (n *NetworkCorrector) BindRTCPReader(reader interceptor.RTCPReader) interceptor.RTCPReader {
+	return interceptor.RTCPReaderFunc(func(b []byte, a interceptor.Attributes) (int, interceptor.Attributes, error) {
+		nRead, attr, err := reader.Read(b, a)
+		if err != nil || nRead == 0 {
+			return nRead, attr, err
+		}
+
+		pkts, uerr := rtcp.Unmarshal(b[:nRead])
+		if uerr == nil {
+			n.onRTCP(pkts) // hier aktualisierst du deinen NetworkState
+		}
+
+		return nRead, attr, err
+	})
+}
+
+func (n *NetworkCorrector) onRTCP(pkts []rtcp.Packet) {
+	now := time.Now()
+
+	// 1) FEEDBACK -> STATE (nur lesen/parsen/ableiten)
+	changed := n.updateNetworkStateFromRTCP(pkts, now)
+
+	// 2) STATE -> DECISION (Regler)
+	// Nur wenn es neue relevante Infos gab (optional)
+	if changed {
+		decision := n.computeDecision(now)
+
+		// 3) DECISION -> APPLY (Stub: später FEC/RTX/NACK steuern)
+		n.applyDecision(decision)
+	}
+}
+
+func (n *NetworkCorrector) updateNetworkStateFromRTCP(pkts []rtcp.Packet, now time.Time) bool {
+	var (
+		gotUpdate bool
+		newState  NetworkState
+	)
+
+	// Ausgangspunkt: alter State übernehmen (damit nicht alles resetet)
+	n.mu.RLock()
+	newState = n.state
+	n.mu.RUnlock()
+
+	for _, p := range pkts {
+		switch pkt := p.(type) {
+
+		case *rtcp.ReceiverReport:
+			// minimal: wir nehmen den ersten Reportblock
+			for _, rb := range pkt.Reports {
+				newState.FractionLost = float64(rb.FractionLost) / 255.0
+				newState.JitterRaw = rb.Jitter
+				newState.UpdatedAt = now
+
+				gotUpdate = true
+				break
+			}
+
+		case *rtcp.TransportLayerCC:
+			// Platzhalter: später TWCC dekodieren -> queueing / delay trend
+			// newState.QueueDelayTrend = ...
+			newState.UpdatedAt = now
+			gotUpdate = true
+
+		case *rtcp.TransportLayerNack:
+			// Platzhalter: später burst loss / repair pressure
+			// z.B. newState.NackRate = ...
+		}
+	}
+
+	if !gotUpdate {
+		return false
+	}
+
+	n.mu.Lock()
+	n.state = newState
+	n.mu.Unlock()
+
+	return true
+}
+
+func (n *NetworkCorrector) computeDecision(now time.Time) Decision {
+	n.mu.RLock()
+	s := n.state
+	n.mu.RUnlock()
+
+	// logic for decision calculation comes here
+
+	return Decision{
+		TargetFECLevel: 0.0,
+		EnableRTX:      true,
+		TargetNackMode: "default",
+		Reason:         fmt.Sprintf("loss=%.3f jitterRaw=%d", s.FractionLost, s.JitterRaw),
+	}
+}
+
+func (n *NetworkCorrector) applyDecision(d Decision) {
+	// TODO: FEC/RTX/NACK update comes here.
+	// - Update FEC
+	// - activate/deactivate RTX/NACK Interceptor
+	// - ...
+
+	fmt.Println("[NC decision]", d.Reason)
+}
+
+func (n *NetworkCorrector) observe() {
+	t := time.NewTicker(n.interval)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-n.stop:
+			return
+		case <-t.C:
+			n.mu.RLock()
+			s := n.state
+			n.mu.RUnlock()
+
+			if s.UpdatedAt.IsZero() {
+				// gets triggered on receiver side
+				// fmt.Println("[nc] no RR yet")
+				continue
+			}
+			fmt.Printf("[NC] loss=%.3f jitterRaw=%d updated=%s\n",
+				s.FractionLost, s.JitterRaw, s.UpdatedAt.Format(time.RFC3339Nano))
+		}
+	}
+}
+
+// No-op Interceptor plumbing
+func (n *NetworkCorrector) BindRTCPWriter(w interceptor.RTCPWriter) interceptor.RTCPWriter { return w }
+func (n *NetworkCorrector) BindLocalStream(_ *interceptor.StreamInfo, w interceptor.RTPWriter) interceptor.RTPWriter {
+	return w
+}
+func (n *NetworkCorrector) UnbindLocalStream(_ *interceptor.StreamInfo) {}
+func (n *NetworkCorrector) BindRemoteStream(_ *interceptor.StreamInfo, r interceptor.RTPReader) interceptor.RTPReader {
+	return r
+}
+func (n *NetworkCorrector) UnbindRemoteStream(_ *interceptor.StreamInfo) {}
+func (n *NetworkCorrector) Close() error                                 { close(n.stop); return nil }
