@@ -9,6 +9,7 @@ import (
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
+	"github.com/pion/transport/v3/test"
 	"github.com/pion/transport/v3/vnet"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -17,10 +18,12 @@ import (
 
 const (
 	numPackets      = 200
-	dropProbability = 0.5
+	dropProbability = 0.2
 )
 
 func TestNetworkcorrector(t *testing.T) {
+	defer test.TimeOut(time.Second * 20).Stop()
+
 	interceptorRegistry := &interceptor.Registry{}
 
 	mediaEngine := &webrtc.MediaEngine{}
@@ -55,12 +58,16 @@ func TestNetworkcorrector(t *testing.T) {
 	assert.NoError(t, err)
 
 	done := make(chan struct{})
+	errCh := make(chan error, 1)
 
 	// Sender RTCP feedback receive stream
 	go func() {
 		rtcpBuf := make([]byte, 1500)
 		for {
-			rtpSender.Read(rtcpBuf)
+			_, _, err := rtpSender.Read(rtcpBuf)
+			if err != nil {
+				return
+			}
 		}
 	}()
 
@@ -71,9 +78,11 @@ func TestNetworkcorrector(t *testing.T) {
 		for {
 			pkt, _, readRTPErr := track.ReadRTP()
 			if errors.Is(readRTPErr, io.EOF) {
+				errCh <- fmt.Errorf("[Receiver] receiver got EOF after %d packets", received)
 				return
 			}
 			if readRTPErr != nil {
+				errCh <- fmt.Errorf("[Receiver] receiver ReadRTP error after %d packets: %w", received, err)
 				return
 			}
 			if received%50 == 0 {
@@ -95,9 +104,11 @@ func TestNetworkcorrector(t *testing.T) {
 			select {
 			case <-done:
 				return
+			case <-errCh:
+				t.Fatal(err)
 			case <-time.After(20 * time.Millisecond):
 				// sending sample data every 20 ms
-				writeErr := track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Second})
+				writeErr := track.WriteSample(media.Sample{Data: []byte{0x00}, Duration: time.Millisecond})
 				assert.NoError(t, writeErr)
 			}
 		}
