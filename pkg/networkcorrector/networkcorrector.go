@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -11,6 +12,11 @@ import (
 )
 
 type MediaType int
+
+const (
+	rtxEnableRTTSeconds  = 0.150 // enable RTX when RTT <= 150ms
+	rtxDisableRTTSeconds = 0.250 // disable RTX when RTT >= 250ms
+)
 
 const (
 	MediaUnknown MediaType = iota
@@ -33,6 +39,7 @@ func (f *Factory) NewInterceptor(id string) (interceptor.Interceptor, error) {
 		interval: f.Interval,
 		id:       id,
 	}
+	nc.rtxEnabled.Store(true)
 
 	// temporary for debugging / understanding
 	go nc.observe()
@@ -49,10 +56,12 @@ type NetworkCorrector struct {
 	// SSRC -> media classification (learned from StreamInfo)
 	ssrcMedia map[uint32]MediaType
 
+	// runtime toggle (1=true, 0=false)
+	rtxEnabled atomic.Bool
+
 	stop     chan struct{}
 	interval time.Duration
-
-	id string
+	id       string
 }
 
 type StreamState struct {
@@ -142,10 +151,36 @@ func (n *NetworkCorrector) BindRTCPReader(reader interceptor.RTCPReader) interce
 		}
 
 		pkts, uerr := rtcp.Unmarshal(b[:nRead])
-		if uerr == nil {
-			n.onRTCP(pkts)
+		if uerr != nil {
+			return nRead, attr, err
 		}
 
+		// Filter: drop NACKs when RTX disabled (for video SSRC only)
+		if !n.rtxEnabled.Load() {
+			filtered := pkts[:0]
+			for _, p := range pkts {
+				if nack, ok := p.(*rtcp.TransportLayerNack); ok {
+					if n.mediaOfSSRC(nack.MediaSSRC) == MediaVideo {
+						continue // drop
+					}
+				}
+				filtered = append(filtered, p)
+			}
+
+			// rewrite buffer so downstream interceptors (RTX) won't see dropped NACKs
+			if len(filtered) != len(pkts) {
+				raw, merr := rtcp.Marshal(filtered)
+				if merr == nil && len(raw) <= len(b) {
+					copy(b, raw)
+					nRead = len(raw)
+					pkts = filtered
+				} else {
+					// if marshal fails, do not partially break RTCP chain; fallback to unfiltered
+				}
+			}
+		}
+
+		n.onRTCP(pkts)
 		return nRead, attr, err
 	})
 }
@@ -222,23 +257,57 @@ func (n *NetworkCorrector) computeDecision(now time.Time) (d Decision, ok bool) 
 		if n.ssrcMedia != nil {
 			mt = n.ssrcMedia[ssrc]
 		}
-		if mt != MediaVideo {
+		if mt != MediaVideo || st.UpdatedAt.IsZero() {
 			continue
 		}
-		if st.UpdatedAt.IsZero() {
-			continue
-		}
+
+		// TODO:
+		// Populate RTTSeconds properly.
+		// Options:
+		// 1) RTCP SR/RR: derive RTT via LSR/DLSR (classic RTCP RTT)
+		// 2) WebRTC stats / ICE candidate pair RTT
+		// 3) TWCC-based delay signals + additional RTT estimator
+		rtt := st.RTTSeconds
+
+		enableRTX := n.rtxEnabledByRTTHysteresis(rtt)
 
 		return Decision{
 			SSRC:           ssrc,
 			TargetFECLevel: 0.0,
-			EnableRTX:      true,
+			EnableRTX:      enableRTX,
 			TargetNackMode: "default",
-			Reason:         fmt.Sprintf("ssrc=%d loss=%.3f jitterRaw=%d", ssrc, st.FractionLost, st.JitterRaw),
+			Reason: fmt.Sprintf(
+				"ssrc=%d loss=%.3f jitterRaw=%d rtt=%.3fs -> RTX=%v (on<=%.3fs off>=%.3fs)",
+				ssrc, st.FractionLost, st.JitterRaw, rtt, enableRTX, rtxEnableRTTSeconds, rtxDisableRTTSeconds,
+			),
 		}, true
 	}
 
 	return Decision{}, false
+}
+
+// Hysteresis: keep current state between thresholds to avoid flapping.
+func (n *NetworkCorrector) rtxEnabledByRTTHysteresis(rttSeconds float64) bool {
+	cur := n.rtxEnabled.Load()
+
+	// If RTT is unknown/unset, keep current state.
+	if rttSeconds <= 0 {
+		return cur
+	}
+
+	if cur {
+		// currently ON -> only switch OFF when RTT is clearly bad
+		if rttSeconds >= rtxDisableRTTSeconds {
+			return false
+		}
+		return true
+	}
+
+	// currently OFF -> only switch ON when RTT is clearly good
+	if rttSeconds <= rtxEnableRTTSeconds {
+		return true
+	}
+	return false
 }
 
 func (n *NetworkCorrector) applyDecision(d Decision) {
@@ -259,11 +328,9 @@ func (n *NetworkCorrector) observe() {
 		case <-n.stop:
 			return
 		case <-t.C:
-			// Snapshot under read lock and print all known streams
 			n.mu.RLock()
 			id := n.id
 
-			// copy maps shallowly for iteration safety (no writes under RLock anyway)
 			streams := n.streams
 			media := n.ssrcMedia
 			n.mu.RUnlock()
