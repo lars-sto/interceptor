@@ -6,6 +6,7 @@ package flexfec
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
@@ -16,6 +17,9 @@ type streamState struct {
 	mu             sync.Mutex
 	flexFecEncoder FlexEncoder
 	packetBuffer   []rtp.Packet
+
+	active atomic.Value // stores activeRuntimeConfig
+	stop   func()       // unsubscribe
 }
 
 // FecInterceptor implements FlexFec.
@@ -26,6 +30,7 @@ type FecInterceptor struct {
 	numMediaPackets uint32
 	numFecPackets   uint32
 	encoderFactory  EncoderFactory
+	cfgSrc          ConfigSource // optional runtime config source
 }
 
 // FecInterceptorFactory creates new FecInterceptors.
@@ -59,9 +64,16 @@ func (r *FecInterceptorFactory) NewInterceptor(_ string) (interceptor.Intercepto
 // UnbindLocalStream removes the stream state for a specific SSRC.
 func (r *FecInterceptor) UnbindLocalStream(info *interceptor.StreamInfo) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	st, ok := r.streams[info.SSRC]
+	if ok {
+		delete(r.streams, info.SSRC)
+	}
+	r.mu.Unlock()
 
-	delete(r.streams, info.SSRC)
+	// Unsubscribe outside lock to avoid deadlocks if source blocks
+	if ok && st.stop != nil {
+		st.stop()
+	}
 }
 
 // BindLocalStream lets you modify any outgoing RTP packets. It is called once for per LocalStream. The returned method
@@ -75,20 +87,70 @@ func (r *FecInterceptor) BindLocalStream(
 
 	mediaSSRC := info.SSRC
 
-	r.mu.Lock()
-	stream := &streamState{
-		// Chromium supports version flexfec-03 of existing draft, this is the one we will configure by default
-		// although we should support configuring the latest (flexfec-20) as well.
-		flexFecEncoder: r.encoderFactory.NewEncoder(info.PayloadTypeForwardErrorCorrection, info.SSRCForwardErrorCorrection),
-		packetBuffer:   make([]rtp.Packet, 0),
+	// Default behavior (backwards compatible): FlexFEC on with static params when negotiated
+	defaultRuntime := RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: r.numMediaPackets,
+		NumFECPackets:   r.numFecPackets,
+		CoverageMode:    CoverageModeInterleaved,
 	}
+
+	defaultActive := activeRuntimeConfig{
+		enabled:          defaultRuntime.Enabled,
+		numMedia:         defaultRuntime.NumMediaPackets,
+		numFec:           defaultRuntime.NumFECPackets,
+		coverageMode:     defaultRuntime.CoverageMode,
+		interleaveStride: defaultRuntime.InterleaveStride,
+		burstSpan:        defaultRuntime.BurstSpan,
+	}
+
+	stream := &streamState{
+		// Chromium supports version flexfec-03 of existing draft, this is the one we configure by default.
+		flexFecEncoder: r.encoderFactory.NewEncoder(info.PayloadTypeForwardErrorCorrection, info.SSRCForwardErrorCorrection),
+		packetBuffer:   make([]rtp.Packet, 0, int(r.numMediaPackets)),
+	}
+	stream.active.Store(defaultActive)
+
+	// Register stream under lock
+	r.mu.Lock()
 	r.streams[mediaSSRC] = stream
 	r.mu.Unlock()
+
+	// Optional: subscribe to runtime config updates for this stream (outside lock)
+	if r.cfgSrc != nil {
+		key := StreamKey{MediaSSRC: mediaSSRC}
+		unsub := r.cfgSrc.Subscribe(key, func(cfg RuntimeConfig) {
+			cfg = cfg.clamp(defaultRuntime)
+
+			cur := defaultActive
+			if !cfg.Enabled || cfg.NumFECPackets == 0 {
+				cur.enabled = false
+			} else {
+				cur.enabled = true
+				cur.numMedia = cfg.NumMediaPackets
+				cur.numFec = cfg.NumFECPackets
+				cur.coverageMode = cfg.CoverageMode
+				cur.interleaveStride = cfg.InterleaveStride
+				cur.burstSpan = cfg.BurstSpan
+			}
+
+			stream.active.Store(cur)
+		})
+
+		// Store unsubscribe safely (no lock required: pointer write is atomic on 64-bit,
+		stream.stop = unsub
+	}
 
 	return interceptor.RTPWriterFunc(
 		func(header *rtp.Header, payload []byte, attributes interceptor.Attributes) (int, error) {
 			// Ignore non-media packets
 			if header.SSRC != mediaSSRC {
+				return writer.Write(header, payload, attributes)
+			}
+
+			cfgAny := stream.active.Load()
+			cfg := cfgAny.(activeRuntimeConfig)
+			if !cfg.enabled || cfg.numFec == 0 {
 				return writer.Write(header, payload, attributes)
 			}
 
@@ -100,10 +162,13 @@ func (r *FecInterceptor) BindLocalStream(
 			})
 
 			// Check if we have enough packets to generate FEC
-			if len(stream.packetBuffer) == int(r.numMediaPackets) {
-				fecPackets = stream.flexFecEncoder.EncodeFec(stream.packetBuffer, r.numFecPackets)
-				// Reset the packet buffer now that we've sent the corresponding FEC packets.
-				stream.packetBuffer = nil
+			if len(stream.packetBuffer) == int(cfg.numMedia) {
+				// v1: encoder uses current interleaved coverage only
+				// coverageMode/stride/span are reserved and will be enforced later in encoder/coverage
+				fecPackets = stream.flexFecEncoder.EncodeFec(stream.packetBuffer, cfg.numFec)
+
+				// Reset the packet buffer now that we've sent the corresponding FEC packets (keep capacity)
+				stream.packetBuffer = stream.packetBuffer[:0]
 			}
 			stream.mu.Unlock()
 
@@ -114,9 +179,8 @@ func (r *FecInterceptor) BindLocalStream(
 			}
 
 			for _, packet := range fecPackets {
-				header := packet.Header
-
-				_, err = writer.Write(&header, packet.Payload, attributes)
+				h := packet.Header
+				_, err = writer.Write(&h, packet.Payload, attributes)
 				if err != nil {
 					errs = append(errs, err)
 				}

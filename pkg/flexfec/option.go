@@ -32,3 +32,12 @@ func FECEncoderFactory(factory EncoderFactory) FecOption {
 		return nil
 	}
 }
+
+// WithConfigSource injects an optional runtime config source
+// If unset, the interceptor behaves exactly as before (static config via options)
+func WithConfigSource(src ConfigSource) FecOption {
+	return func(f *FecInterceptor) error {
+		f.cfgSrc = src
+		return nil
+	}
+}
