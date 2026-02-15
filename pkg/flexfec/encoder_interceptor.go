@@ -105,7 +105,7 @@ func (r *FecInterceptor) BindLocalStream(
 	}
 
 	stream := &streamState{
-		// Chromium supports version flexfec-03 of existing draft, this is the one we configure by default.
+		// Chromium supports version flexfec-03 of existing draft, this is the one we configure by default
 		flexFecEncoder: r.encoderFactory.NewEncoder(info.PayloadTypeForwardErrorCorrection, info.SSRCForwardErrorCorrection),
 		packetBuffer:   make([]rtp.Packet, 0, int(r.numMediaPackets)),
 	}
@@ -122,22 +122,36 @@ func (r *FecInterceptor) BindLocalStream(
 		unsub := r.cfgSrc.Subscribe(key, func(cfg RuntimeConfig) {
 			cfg = cfg.clamp(defaultRuntime)
 
-			cur := defaultActive
+			// Decide new active
+			prevAny := stream.active.Load()
+			prev := prevAny.(activeRuntimeConfig)
+
+			next := prev
 			if !cfg.Enabled || cfg.NumFECPackets == 0 {
-				cur.enabled = false
+				next.enabled = false
 			} else {
-				cur.enabled = true
-				cur.numMedia = cfg.NumMediaPackets
-				cur.numFec = cfg.NumFECPackets
-				cur.coverageMode = cfg.CoverageMode
-				cur.interleaveStride = cfg.InterleaveStride
-				cur.burstSpan = cfg.BurstSpan
+				next.enabled = true
+				next.numMedia = cfg.NumMediaPackets
+				next.numFec = cfg.NumFECPackets
+				next.coverageMode = cfg.CoverageMode
+				next.interleaveStride = cfg.InterleaveStride
+				next.burstSpan = cfg.BurstSpan
 			}
 
-			stream.active.Store(cur)
+			// Reset buffer on disabling or batch-size changes (avoid mixing / dead zones)
+			needReset := (!next.enabled && prev.enabled) ||
+				(next.enabled && prev.enabled && next.numMedia != prev.numMedia)
+
+			if needReset {
+				stream.mu.Lock()
+				stream.packetBuffer = stream.packetBuffer[:0]
+				stream.mu.Unlock()
+			}
+
+			stream.active.Store(next)
 		})
 
-		// Store unsubscribe safely (no lock required: pointer write is atomic on 64-bit,
+		// Store unsubscribe safely (no lock required: pointer write is atomic on 64-bit
 		stream.stop = unsub
 	}
 
