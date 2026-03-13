@@ -490,7 +490,6 @@ func TestFecInterceptor_RuntimeConfigUpdateChangesBatchSize(t *testing.T) {
 		Enabled:         true,
 		NumMediaPackets: 2,
 		NumFECPackets:   1,
-		CoverageMode:    flexfec.CoverageModeInterleaved,
 	})
 
 	// Write two media packets. We expect 2 media + 1 FEC written
@@ -666,38 +665,6 @@ func TestFecInterceptor_UnbindUnsubscribes(t *testing.T) {
 	assert.Equal(t, 1, src.unsubscribes(mediaSSRC), "Expected exactly one unsubscribe call")
 }
 
-// Encoder that returns a distinct FEC packet per call so we can assert we got 2 batches
-type togglingEncoder struct {
-	mu        sync.Mutex
-	callCount int
-}
-
-func (e *togglingEncoder) EncodeFec(mediaPackets []rtp.Packet, numFecPackets uint32) []rtp.Packet {
-	const (
-		mediaSSRC = uint32(1000)
-		fecSSRC   = uint32(2000)
-		fecPT     = uint8(100)
-	)
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.callCount++
-
-	out := make([]rtp.Packet, 0, numFecPackets)
-	for i := uint32(0); i < numFecPackets; i++ {
-		out = append(out, rtp.Packet{
-			Header: rtp.Header{
-				SSRC:           fecSSRC,
-				PayloadType:    fecPT,
-				SequenceNumber: uint16(1000 + e.callCount), // distinct per batch
-			},
-			// last byte encodes which batch this was (1 then 2)
-			Payload: []byte{0xFE, 0xC0, 0xDE, byte(e.callCount)},
-		})
-	}
-	return out
-}
-
 type CountingFlexEncoder struct {
 	mu        sync.Mutex
 	CallCount int
@@ -802,17 +769,14 @@ func TestFecInterceptor_RuntimeConfigToggleOnOffOnSendsTwoFecBatches(t *testing.
 		}
 	}
 
-	// Phase 1: ON, batch=2 => after 2 media -> 1 FEC
 	src.publish(mediaSSRC, flexfec.RuntimeConfig{
 		Enabled:         true,
 		NumMediaPackets: 2,
 		NumFECPackets:   1,
-		CoverageMode:    flexfec.CoverageModeInterleaved,
 	})
 	writeMedia(1, 2)
 	p1 := readN(t, stream.WrittenRTP(), 3, 500*time.Millisecond) // 2 media + 1 fec
 
-	// Phase 2: OFF => after 2 media -> 0 FEC
 	src.publish(mediaSSRC, flexfec.RuntimeConfig{
 		Enabled:         false,
 		NumMediaPackets: 2,
@@ -821,17 +785,14 @@ func TestFecInterceptor_RuntimeConfigToggleOnOffOnSendsTwoFecBatches(t *testing.
 	writeMedia(3, 2)
 	p2 := readN(t, stream.WrittenRTP(), 2, 500*time.Millisecond) // only 2 media
 
-	// Phase 3: ON again, batch=2 => after 2 media -> 1 FEC
 	src.publish(mediaSSRC, flexfec.RuntimeConfig{
 		Enabled:         true,
 		NumMediaPackets: 2,
 		NumFECPackets:   1,
-		CoverageMode:    flexfec.CoverageModeInterleaved,
 	})
 	writeMedia(5, 2)
 	p3 := readN(t, stream.WrittenRTP(), 3, 500*time.Millisecond) // 2 media + 1 fec
 
-	// Assertions: phase-wise
 	countFec := func(pkts []*rtp.Packet) (media, fec int, markers []byte) {
 		for _, pkt := range pkts {
 			if pkt.PayloadType == 96 {
@@ -911,15 +872,12 @@ func TestFecInterceptor_DisableMidBufferResetsStateBeforeReenable(t *testing.T) 
 		assert.NoError(t, stream.WriteRTP(p))
 	}
 
-	// Enable with batch=4
 	src.publish(mediaSSRC, flexfec.RuntimeConfig{
 		Enabled:         true,
 		NumMediaPackets: 4,
 		NumFECPackets:   1,
-		CoverageMode:    flexfec.CoverageModeInterleaved,
 	})
 
-	// Write 2 (half full). Expect only 2 media, no FEC
 	writeOne(1)
 	writeOne(2)
 	pA := readN(t, stream.WrittenRTP(), 2, 500*time.Millisecond)
@@ -934,7 +892,6 @@ func TestFecInterceptor_DisableMidBufferResetsStateBeforeReenable(t *testing.T) 
 		NumFECPackets:   1,
 	})
 
-	// While disabled, writes are pass-through, still no FEC.
 	writeOne(3)
 	writeOne(4)
 	pB := readN(t, stream.WrittenRTP(), 2, 500*time.Millisecond)
@@ -942,15 +899,12 @@ func TestFecInterceptor_DisableMidBufferResetsStateBeforeReenable(t *testing.T) 
 		assert.Equal(t, uint8(96), pkt.PayloadType)
 	}
 
-	// Re-enable with batch=4 again.
 	src.publish(mediaSSRC, flexfec.RuntimeConfig{
 		Enabled:         true,
 		NumMediaPackets: 4,
 		NumFECPackets:   1,
-		CoverageMode:    flexfec.CoverageModeInterleaved,
 	})
 
-	// Now: first 3 new packets should still not produce FEC.
 	writeOne(5)
 	writeOne(6)
 	writeOne(7)
@@ -959,7 +913,6 @@ func TestFecInterceptor_DisableMidBufferResetsStateBeforeReenable(t *testing.T) 
 		assert.Equal(t, uint8(96), pkt.PayloadType)
 	}
 
-	// 4th new packet should trigger 1 FEC: total 2 packets written (media + fec)
 	writeOne(8)
 	pD := readN(t, stream.WrittenRTP(), 2, 500*time.Millisecond)
 
@@ -978,4 +931,213 @@ func TestFecInterceptor_DisableMidBufferResetsStateBeforeReenable(t *testing.T) 
 	enc.mu.Lock()
 	defer enc.mu.Unlock()
 	assert.Equal(t, 1, enc.CallCount, "expected exactly one encode call after re-enable")
+}
+
+func TestFecInterceptor_RuntimeConfigZeroFECDisablesBypass(t *testing.T) {
+	const (
+		mediaSSRC = uint32(1000)
+		fecSSRC   = uint32(2000)
+		fecPT     = uint8(100)
+	)
+
+	mockEncoder := NewMockFlexEncoder(nil)
+	mockFactory := NewMockEncoderFactory(mockEncoder)
+	src := newTestConfigSource()
+
+	factory, err := flexfec.NewFecInterceptor(
+		flexfec.FECEncoderFactory(mockFactory),
+		flexfec.NumMediaPackets(2),
+		flexfec.NumFECPackets(1),
+		flexfec.WithConfigSource(src),
+	)
+	assert.NoError(t, err)
+
+	itc, err := factory.NewInterceptor("")
+	assert.NoError(t, err)
+
+	info := &interceptor.StreamInfo{
+		SSRC:                              mediaSSRC,
+		PayloadTypeForwardErrorCorrection: fecPT,
+		SSRCForwardErrorCorrection:        fecSSRC,
+	}
+
+	stream := test.NewMockStream(info, itc)
+	defer assert.NoError(t, stream.Close())
+
+	src.publish(mediaSSRC, flexfec.RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: 2,
+		NumFECPackets:   0,
+	})
+
+	for seq := uint16(1); seq <= 2; seq++ {
+		err = stream.WriteRTP(&rtp.Packet{
+			Header: rtp.Header{
+				SSRC:           mediaSSRC,
+				SequenceNumber: seq,
+				PayloadType:    96,
+			},
+			Payload: []byte{0xAA},
+		})
+		assert.NoError(t, err)
+	}
+
+	var mediaCount, fecCount int
+	for i := 0; i < 2; i++ {
+		select {
+		case pkt := <-stream.WrittenRTP():
+			if pkt.PayloadType == 96 {
+				mediaCount++
+			}
+			if pkt.PayloadType == fecPT {
+				fecCount++
+			}
+		default:
+			assert.Fail(t, "Not enough packets were written")
+		}
+	}
+
+	select {
+	case <-stream.WrittenRTP():
+		assert.Fail(t, "Unexpected extra packet written")
+	default:
+	}
+
+	assert.Equal(t, 2, mediaCount)
+	assert.Equal(t, 0, fecCount)
+	assert.False(t, mockEncoder.Called)
+}
+
+func TestFecInterceptor_StaticZeroFECDisablesBypass(t *testing.T) {
+	const (
+		mediaSSRC = uint32(1000)
+		fecSSRC   = uint32(2000)
+		fecPT     = uint8(100)
+	)
+
+	mockEncoder := NewMockFlexEncoder(nil)
+	mockFactory := NewMockEncoderFactory(mockEncoder)
+
+	factory, err := flexfec.NewFecInterceptor(
+		flexfec.FECEncoderFactory(mockFactory),
+		flexfec.NumMediaPackets(2),
+		flexfec.NumFECPackets(0),
+	)
+	assert.NoError(t, err)
+
+	itc, err := factory.NewInterceptor("")
+	assert.NoError(t, err)
+
+	info := &interceptor.StreamInfo{
+		SSRC:                              mediaSSRC,
+		PayloadTypeForwardErrorCorrection: fecPT,
+		SSRCForwardErrorCorrection:        fecSSRC,
+	}
+
+	stream := test.NewMockStream(info, itc)
+	defer assert.NoError(t, stream.Close())
+
+	for seq := uint16(1); seq <= 2; seq++ {
+		err = stream.WriteRTP(&rtp.Packet{
+			Header: rtp.Header{
+				SSRC:           mediaSSRC,
+				SequenceNumber: seq,
+				PayloadType:    96,
+			},
+			Payload: []byte{0xAA},
+		})
+		assert.NoError(t, err)
+	}
+
+	var mediaCount, fecCount int
+	for i := 0; i < 2; i++ {
+		select {
+		case pkt := <-stream.WrittenRTP():
+			if pkt.PayloadType == 96 {
+				mediaCount++
+			}
+			if pkt.PayloadType == fecPT {
+				fecCount++
+			}
+		default:
+			assert.Fail(t, "Not enough packets were written")
+		}
+	}
+
+	select {
+	case <-stream.WrittenRTP():
+		assert.Fail(t, "Unexpected extra packet written")
+	default:
+	}
+
+	assert.Equal(t, 2, mediaCount)
+	assert.Equal(t, 0, fecCount)
+	assert.False(t, mockEncoder.Called, "EncodeFec should not be called when statically disabled via NumFECPackets(0)")
+}
+
+func TestFecInterceptor_StaticZeroMediaDisablesBypass(t *testing.T) {
+	const (
+		mediaSSRC = uint32(1000)
+		fecSSRC   = uint32(2000)
+		fecPT     = uint8(100)
+	)
+
+	mockEncoder := NewMockFlexEncoder(nil)
+	mockFactory := NewMockEncoderFactory(mockEncoder)
+
+	factory, err := flexfec.NewFecInterceptor(
+		flexfec.FECEncoderFactory(mockFactory),
+		flexfec.NumMediaPackets(0),
+		flexfec.NumFECPackets(1),
+	)
+	assert.NoError(t, err)
+
+	itc, err := factory.NewInterceptor("")
+	assert.NoError(t, err)
+
+	info := &interceptor.StreamInfo{
+		SSRC:                              mediaSSRC,
+		PayloadTypeForwardErrorCorrection: fecPT,
+		SSRCForwardErrorCorrection:        fecSSRC,
+	}
+
+	stream := test.NewMockStream(info, itc)
+	defer assert.NoError(t, stream.Close())
+
+	for seq := uint16(1); seq <= 2; seq++ {
+		err = stream.WriteRTP(&rtp.Packet{
+			Header: rtp.Header{
+				SSRC:           mediaSSRC,
+				SequenceNumber: seq,
+				PayloadType:    96,
+			},
+			Payload: []byte{0xBB},
+		})
+		assert.NoError(t, err)
+	}
+
+	var mediaCount, fecCount int
+	for i := 0; i < 2; i++ {
+		select {
+		case pkt := <-stream.WrittenRTP():
+			if pkt.PayloadType == 96 {
+				mediaCount++
+			}
+			if pkt.PayloadType == fecPT {
+				fecCount++
+			}
+		default:
+			assert.Fail(t, "Not enough packets were written")
+		}
+	}
+
+	select {
+	case <-stream.WrittenRTP():
+		assert.Fail(t, "Unexpected extra packet written")
+	default:
+	}
+
+	assert.Equal(t, 2, mediaCount)
+	assert.Equal(t, 0, fecCount)
+	assert.False(t, mockEncoder.Called, "EncodeFec should not be called when statically disabled via NumMediaPackets(0)")
 }

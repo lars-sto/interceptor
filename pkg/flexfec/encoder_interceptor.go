@@ -17,9 +17,8 @@ type streamState struct {
 	mu             sync.Mutex
 	flexFecEncoder FlexEncoder
 	packetBuffer   []rtp.Packet
-
-	active atomic.Value // stores activeRuntimeConfig
-	stop   func()       // unsubscribe
+	active         atomic.Value // stores activeRuntimeConfig
+	stop           func()       // unsubscribe callback for runtime config updates
 }
 
 // FecInterceptor implements FlexFec.
@@ -30,7 +29,7 @@ type FecInterceptor struct {
 	numMediaPackets uint32
 	numFecPackets   uint32
 	encoderFactory  EncoderFactory
-	cfgSrc          ConfigSource // optional runtime config source
+	cfgSrc          ConfigSource
 }
 
 // FecInterceptorFactory creates new FecInterceptors.
@@ -70,9 +69,17 @@ func (r *FecInterceptor) UnbindLocalStream(info *interceptor.StreamInfo) {
 	}
 	r.mu.Unlock()
 
-	// Unsubscribe outside lock to avoid deadlocks if source blocks
-	if ok && st.stop != nil {
-		st.stop()
+	if !ok {
+		return
+	}
+
+	st.mu.Lock()
+	stop := st.stop
+	st.stop = nil
+	st.mu.Unlock()
+
+	if stop != nil {
+		stop()
 	}
 }
 
@@ -87,72 +94,41 @@ func (r *FecInterceptor) BindLocalStream(
 
 	mediaSSRC := info.SSRC
 
-	// Default behavior (backwards compatible): FlexFEC on with static params when negotiated
-	defaultRuntime := RuntimeConfig{
+	initial := RuntimeConfig{
 		Enabled:         true,
 		NumMediaPackets: r.numMediaPackets,
 		NumFECPackets:   r.numFecPackets,
-		CoverageMode:    CoverageModeInterleaved,
-	}
+	}.clamp()
 
-	defaultActive := activeRuntimeConfig{
-		enabled:          defaultRuntime.Enabled,
-		numMedia:         defaultRuntime.NumMediaPackets,
-		numFec:           defaultRuntime.NumFECPackets,
-		coverageMode:     defaultRuntime.CoverageMode,
-		interleaveStride: defaultRuntime.InterleaveStride,
-		burstSpan:        defaultRuntime.BurstSpan,
+	initialActive := activeRuntimeConfig{
+		enabled:  initial.Enabled && initial.NumMediaPackets > 0 && initial.NumFECPackets > 0,
+		numMedia: initial.NumMediaPackets,
+		numFec:   initial.NumFECPackets,
 	}
 
 	stream := &streamState{
 		// Chromium supports version flexfec-03 of existing draft, this is the one we configure by default
-		flexFecEncoder: r.encoderFactory.NewEncoder(info.PayloadTypeForwardErrorCorrection, info.SSRCForwardErrorCorrection),
-		packetBuffer:   make([]rtp.Packet, 0, int(r.numMediaPackets)),
+		flexFecEncoder: r.encoderFactory.NewEncoder(
+			info.PayloadTypeForwardErrorCorrection, info.SSRCForwardErrorCorrection),
+		packetBuffer: make([]rtp.Packet, 0, int(initial.NumMediaPackets)),
 	}
-	stream.active.Store(defaultActive)
+	stream.active.Store(initialActive)
 
 	// Register stream under lock
 	r.mu.Lock()
 	r.streams[mediaSSRC] = stream
 	r.mu.Unlock()
 
-	// Optional: subscribe to runtime config updates for this stream (outside lock)
+	// Optional: subscribe to runtime config updates for this stream
 	if r.cfgSrc != nil {
 		key := StreamKey{MediaSSRC: mediaSSRC}
 		unsub := r.cfgSrc.Subscribe(key, func(cfg RuntimeConfig) {
-			cfg = cfg.clamp(defaultRuntime)
-
-			// Decide new active
-			prevAny := stream.active.Load()
-			prev := prevAny.(activeRuntimeConfig)
-
-			next := prev
-			if !cfg.Enabled || cfg.NumFECPackets == 0 {
-				next.enabled = false
-			} else {
-				next.enabled = true
-				next.numMedia = cfg.NumMediaPackets
-				next.numFec = cfg.NumFECPackets
-				next.coverageMode = cfg.CoverageMode
-				next.interleaveStride = cfg.InterleaveStride
-				next.burstSpan = cfg.BurstSpan
-			}
-
-			// Reset buffer on disabling or batch-size changes (avoid mixing / dead zones)
-			needReset := (!next.enabled && prev.enabled) ||
-				(next.enabled && prev.enabled && next.numMedia != prev.numMedia)
-
-			if needReset {
-				stream.mu.Lock()
-				stream.packetBuffer = stream.packetBuffer[:0]
-				stream.mu.Unlock()
-			}
-
-			stream.active.Store(next)
+			stream.applyRuntimeConfig(cfg)
 		})
 
-		// Store unsubscribe safely (no lock required: pointer write is atomic on 64-bit
+		stream.mu.Lock()
 		stream.stop = unsub
+		stream.mu.Unlock()
 	}
 
 	return interceptor.RTPWriterFunc(
@@ -164,7 +140,7 @@ func (r *FecInterceptor) BindLocalStream(
 
 			cfgAny := stream.active.Load()
 			cfg := cfgAny.(activeRuntimeConfig)
-			if !cfg.enabled || cfg.numFec == 0 {
+			if !cfg.enabled {
 				return writer.Write(header, payload, attributes)
 			}
 
@@ -177,8 +153,6 @@ func (r *FecInterceptor) BindLocalStream(
 
 			// Check if we have enough packets to generate FEC
 			if len(stream.packetBuffer) == int(cfg.numMedia) {
-				// v1: encoder uses current interleaved coverage only
-				// coverageMode/stride/span are reserved and will be enforced later in encoder/coverage
 				fecPackets = stream.flexFecEncoder.EncodeFec(stream.packetBuffer, cfg.numFec)
 
 				// Reset the packet buffer now that we've sent the corresponding FEC packets (keep capacity)
@@ -203,4 +177,31 @@ func (r *FecInterceptor) BindLocalStream(
 			return result, errors.Join(errs...)
 		},
 	)
+}
+
+func (s *streamState) applyRuntimeConfig(cfg RuntimeConfig) {
+	cfg = cfg.clamp()
+
+	prevAny := s.active.Load()
+	prev := prevAny.(activeRuntimeConfig)
+
+	next := prev
+	next.numMedia = cfg.NumMediaPackets
+	next.numFec = cfg.NumFECPackets
+	next.enabled = cfg.Enabled && cfg.NumMediaPackets > 0 && cfg.NumFECPackets > 0
+
+	// Reset buffered media when disabling or changing batch size to avoid
+	// mixing packets collected under different runtime settings
+	needReset := (!next.enabled && prev.enabled) ||
+		(next.enabled && prev.enabled && next.numMedia != prev.numMedia)
+
+	if needReset {
+		s.mu.Lock()
+		s.packetBuffer = s.packetBuffer[:0]
+		s.mu.Unlock()
+	}
+
+	// Publish the new active config for subsequent writes. A write that has already
+	// loaded the previous config may still complete under the old settings
+	s.active.Store(next)
 }

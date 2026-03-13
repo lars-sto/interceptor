@@ -9,51 +9,84 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestRuntimeConfig_ClampDefaultsAndBounds(t *testing.T) {
-	def := RuntimeConfig{
-		Enabled:         true,
-		NumMediaPackets: 5,
-		NumFECPackets:   2,
-		CoverageMode:    CoverageModeInterleaved,
-	}
-
+func TestRuntimeConfig_ClampClampsFECToMedia(t *testing.T) {
 	in := RuntimeConfig{
-		Enabled:          true,
-		NumMediaPackets:  0,   // should become 5
-		NumFECPackets:    999, // should clamp to media
-		CoverageMode:     "",  // should become interleaved
-		InterleaveStride: 123, // should pass through
-		BurstSpan:        7,   // should pass through
+		Enabled:         true,
+		NumMediaPackets: 4,
+		NumFECPackets:   999,
 	}
 
-	out := in.clamp(def)
+	out := in.clamp()
 
-	assert.Equal(t, uint32(5), out.NumMediaPackets)
-	assert.Equal(t, uint32(5), out.NumFECPackets)
-	assert.Equal(t, CoverageModeInterleaved, out.CoverageMode)
-	assert.Equal(t, uint32(123), out.InterleaveStride)
-	assert.Equal(t, uint32(7), out.BurstSpan)
+	assert.Equal(t, true, out.Enabled)
+	assert.Equal(t, uint32(4), out.NumMediaPackets)
+	assert.Equal(t, uint32(4), out.NumFECPackets)
 }
 
-func TestRuntimeConfig_ToActiveUsesClamp(t *testing.T) {
-	def := RuntimeConfig{
-		Enabled:         true,
-		NumMediaPackets: 10,
-		NumFECPackets:   3,
-		CoverageMode:    CoverageModeInterleaved,
-	}
-
+func TestRuntimeConfig_ClampKeepsExplicitValues(t *testing.T) {
 	in := RuntimeConfig{
 		Enabled:         false,
-		NumMediaPackets: 0,  // should take default
-		NumFECPackets:   99, // should clamp to media=10
-		CoverageMode:    "", // should take default
+		NumMediaPackets: 4,
+		NumFECPackets:   1,
 	}
 
-	a := in.toActive(def)
+	out := in.clamp()
 
-	assert.Equal(t, false, a.enabled)
-	assert.Equal(t, uint32(10), a.numMedia)
-	assert.Equal(t, uint32(10), a.numFec)
-	assert.Equal(t, CoverageModeInterleaved, a.coverageMode)
+	assert.Equal(t, false, out.Enabled)
+	assert.Equal(t, uint32(4), out.NumMediaPackets)
+	assert.Equal(t, uint32(1), out.NumFECPackets)
+}
+
+func TestRuntimeConfig_ClampKeepsZeroValues(t *testing.T) {
+	in := RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: 0,
+		NumFECPackets:   0,
+	}
+
+	out := in.clamp()
+
+	assert.Equal(t, true, out.Enabled)
+	assert.Equal(t, uint32(0), out.NumMediaPackets)
+	assert.Equal(t, uint32(0), out.NumFECPackets)
+}
+
+func TestRuntimeConfig_ClampDoesNotChangeEqualMediaAndFEC(t *testing.T) {
+	in := RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: 5,
+		NumFECPackets:   5,
+	}
+
+	out := in.clamp()
+
+	assert.Equal(t, true, out.Enabled)
+	assert.Equal(t, uint32(5), out.NumMediaPackets)
+	assert.Equal(t, uint32(5), out.NumFECPackets)
+}
+
+func TestRuntimeConfig_ClampClampsMediaToMax(t *testing.T) {
+	in := RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: MaxMediaPackets + 10,
+		NumFECPackets:   1,
+	}
+
+	out := in.clamp()
+
+	assert.Equal(t, MaxMediaPackets, out.NumMediaPackets)
+	assert.Equal(t, uint32(1), out.NumFECPackets)
+}
+
+func TestRuntimeConfig_ClampClampsFECToMax(t *testing.T) {
+	in := RuntimeConfig{
+		Enabled:         true,
+		NumMediaPackets: MaxMediaPackets,
+		NumFECPackets:   MaxFecPackets + 10,
+	}
+
+	out := in.clamp()
+
+	assert.Equal(t, MaxMediaPackets, out.NumMediaPackets)
+	assert.Equal(t, MaxMediaPackets, out.NumFECPackets)
 }
